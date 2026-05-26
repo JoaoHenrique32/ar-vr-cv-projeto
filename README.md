@@ -73,7 +73,8 @@ Arquivos adicionados para containerização:
 
 ```bash
 cp .env.example .env
-# opcional: edite OPENAI_API_KEY no .env para habilitar /worldgen
+# obrigatório em produção: APP_ACCESS_PASSWORD e FLASK_SECRET_KEY
+# opcional: OPENAI_API_KEY para habilitar /worldgen
 docker compose up -d --build
 ```
 
@@ -95,7 +96,11 @@ docker compose down
 
 1. No Coolify, crie um novo recurso do tipo **Docker Compose** apontando para este repositório.
 2. Use o arquivo `docker-compose.yml` da raiz do projeto.
-3. Configure a variável de ambiente `OPENAI_API_KEY` no painel do Coolify (se quiser usar `/worldgen`).
+3. Configure no painel do Coolify as variáveis:
+  - `APP_ACCESS_PASSWORD` (obrigatória)
+  - `FLASK_SECRET_KEY` (obrigatória)
+  - `SESSION_COOKIE_SECURE=true` (recomendado com HTTPS)
+  - `OPENAI_API_KEY` (obrigatória apenas para `/worldgen`)
 4. Faça o deploy.
 
 Observações:
@@ -103,6 +108,23 @@ Observações:
 - O serviço escuta internamente na porta `5000`.
 - O diretório `models/` é montado como volume para evitar novo download dos modelos MediaPipe a cada reinício.
 - O parâmetro `DEBUG` está como `false` no Compose para execução de produção.
+- Com `DEBUG=false`, o servidor falha ao iniciar se `APP_ACCESS_PASSWORD` e `FLASK_SECRET_KEY` não estiverem definidas.
+
+## Autenticação mínima (anti-abuso)
+
+Quando `APP_ACCESS_PASSWORD` está definida:
+
+- Todas as páginas exigem login em `/login`.
+- Conexões Socket.IO sem sessão autenticada são rejeitadas.
+- O evento de geração do World Gen (`worldgen_generate`) também valida autenticação.
+
+Rotas públicas sem login:
+
+- `/login`
+- `/healthz`
+- `/static/*`
+
+Para encerrar a sessão, acesse `/logout`.
 
 ## GitHub Codespaces (comandos validados)
 

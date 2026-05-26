@@ -10,17 +10,19 @@ Este servidor fornece:
 """
 
 import base64
+import hmac
 import io
 import json
 import logging
 import os
+from datetime import timedelta
 
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks.python import vision as mp_vision
 from mediapipe.tasks.python import BaseOptions as MpBaseOptions
-from flask import Flask, render_template
+from flask import Flask, redirect, render_template, request, session, url_for
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 # ---------------------------------------------------------------------------
@@ -44,10 +46,37 @@ def _valid_color(value: str, default: str = "#4CC3D9") -> str:
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "arvrcv-base-server-secret"
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY", "arvrcv-base-server-secret")
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() in {"1", "true", "yes", "on"}
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
 # allow_upgrades=True garante suporte a WebSocket via eventlet/gevent
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger=False, engineio_logger=False)
+
+AUTH_PASSWORD_ENV = "APP_ACCESS_PASSWORD"
+
+
+def _auth_enabled() -> bool:
+    """Ativa autenticação apenas quando APP_ACCESS_PASSWORD estiver definida."""
+    return bool((os.environ.get(AUTH_PASSWORD_ENV) or "").strip())
+
+
+def _is_authenticated() -> bool:
+    return session.get("authenticated", False) is True
+
+
+def _is_public_path(path: str) -> bool:
+    return path.startswith("/static/") or path in {"/login", "/healthz", "/favicon.ico"}
+
+
+def _safe_next_url() -> str:
+    """Evita open redirect: só aceita caminhos internos absolutos."""
+    next_url = request.args.get("next", "")
+    if next_url.startswith("/") and not next_url.startswith("//"):
+        return next_url
+    return url_for("index")
 
 # ---------------------------------------------------------------------------
 # MediaPipe – Detecção de mãos e pose (Tasks API)
@@ -504,6 +533,56 @@ def index():
     return render_template("index.html")
 
 
+@app.before_request
+def _enforce_auth():
+    """Bloqueia acesso público quando APP_ACCESS_PASSWORD estiver definida."""
+    if not _auth_enabled():
+        return None
+
+    if _is_public_path(request.path):
+        return None
+
+    if _is_authenticated():
+        return None
+
+    return redirect(url_for("login", next=request.path))
+
+
+@app.route("/healthz")
+def healthz():
+    """Healthcheck público para Docker/Coolify."""
+    return {"status": "ok"}, 200
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Login com senha única para proteger uso de recursos externos."""
+    if not _auth_enabled():
+        return redirect(url_for("index"))
+
+    error = None
+    next_url = _safe_next_url()
+
+    if request.method == "POST":
+        submitted = (request.form.get("password") or "").strip()
+        expected = (os.environ.get(AUTH_PASSWORD_ENV) or "").strip()
+
+        if submitted and expected and hmac.compare_digest(submitted, expected):
+            session["authenticated"] = True
+            session.permanent = True
+            return redirect(next_url)
+
+        error = "Senha inválida."
+
+    return render_template("login.html", error=error, next_url=next_url)
+
+
+@app.route("/logout")
+def logout():
+    session.pop("authenticated", None)
+    return redirect(url_for("login"))
+
+
 @app.route("/arvr")
 def arvr():
     """Interface de Realidade Aumentada e Virtual."""
@@ -534,6 +613,9 @@ def worldgen_page():
 
 @socketio.on("connect")
 def on_connect():
+    if _auth_enabled() and not _is_authenticated():
+        logger.warning("Conexão Socket.IO rejeitada por falta de autenticação.")
+        return False
     logger.info("Cliente conectado: %s", socketio.server.eio.sockets.keys() if hasattr(socketio.server, "eio") else "?")
 
 
@@ -1061,6 +1143,10 @@ def on_worldgen_generate(data):
 
     data = {"prompt": "...", "model": "gpt-4o-mini"}
     """
+    if _auth_enabled() and not _is_authenticated():
+        emit("worldgen_result", {"error": "Sessão não autenticada."})
+        return
+
     prompt = (data.get("prompt") or "").strip()
     model = data.get("model", "gpt-4o-mini")
     engine = data.get("engine", "threejs")
@@ -1235,6 +1321,18 @@ if __name__ == "__main__":
     print("  Servidor Base AR/VR + Visão Computacional")
     port = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("DEBUG", "true").lower() in {"1", "true", "yes", "on"}
+
+    if not debug and not _auth_enabled():
+        raise RuntimeError("APP_ACCESS_PASSWORD é obrigatória quando DEBUG=false.")
+    if not debug and app.config["SECRET_KEY"] == "arvrcv-base-server-secret":
+        raise RuntimeError("FLASK_SECRET_KEY é obrigatória quando DEBUG=false.")
+
     print(f"  Acesse: http://localhost:{port}")
+    if _auth_enabled():
+        print("  Auth: ativa (login por senha compartilhada)")
+        if app.config["SECRET_KEY"] == "arvrcv-base-server-secret":
+            logger.warning("FLASK_SECRET_KEY não definida. Defina uma chave forte em produção.")
+    else:
+        print("  Auth: desativada (APP_ACCESS_PASSWORD vazia)")
     print("=" * 60)
     socketio.run(app, host="0.0.0.0", port=port, debug=debug)
