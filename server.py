@@ -1233,6 +1233,8 @@ def on_worldgen_share(data):
 if __name__ == "__main__":
     print("=" * 60)
     print("  Servidor Base AR/VR + Visão Computacional")
-    print("  Acesse: http://localhost:5000")
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("DEBUG", "true").lower() in {"1", "true", "yes", "on"}
+    print(f"  Acesse: http://localhost:{port}")
     print("=" * 60)
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+    socketio.run(app, host="0.0.0.0", port=port, debug=debug)

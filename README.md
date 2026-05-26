@@ -60,6 +60,50 @@ python server.py
 
 Acesse **http://localhost:5000**.
 
+## Docker Compose (recomendado para deploy no Coolify)
+
+Arquivos adicionados para containerização:
+
+- `Dockerfile`
+- `docker-compose.yml`
+- `.dockerignore`
+- `.env.example`
+
+### Subir localmente com Docker Compose
+
+```bash
+cp .env.example .env
+# opcional: edite OPENAI_API_KEY no .env para habilitar /worldgen
+docker compose up -d --build
+```
+
+Aplicação disponível em **http://localhost:5000** (ou na porta definida em `HOST_PORT`).
+
+Para acompanhar logs:
+
+```bash
+docker compose logs -f app
+```
+
+Para parar:
+
+```bash
+docker compose down
+```
+
+### Deploy no Coolify com Docker Compose
+
+1. No Coolify, crie um novo recurso do tipo **Docker Compose** apontando para este repositório.
+2. Use o arquivo `docker-compose.yml` da raiz do projeto.
+3. Configure a variável de ambiente `OPENAI_API_KEY` no painel do Coolify (se quiser usar `/worldgen`).
+4. Faça o deploy.
+
+Observações:
+
+- O serviço escuta internamente na porta `5000`.
+- O diretório `models/` é montado como volume para evitar novo download dos modelos MediaPipe a cada reinício.
+- O parâmetro `DEBUG` está como `false` no Compose para execução de produção.
+
 ## GitHub Codespaces (comandos validados)
 
 Este foi o fluxo executado e validado no Codespace deste repositório:
