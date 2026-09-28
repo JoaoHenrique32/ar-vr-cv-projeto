@@ -88,6 +88,19 @@
       </div>
     </div>
 
+    <!-- Pessoas detectadas (modo Rostos) -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>👥 Pessoas detectadas</span>
+        <span id="faceCount" style="background:var(--primary);border-radius:12px;padding:.1rem .6rem;font-size:.8rem">0</span>
+      </div>
+      <div class="object-list" id="faceList">
+        <div style="color:var(--text-muted);font-size:.85rem;text-align:center;padding:1rem">
+          Abra CV → 3D (ou Visão Computacional) no modo "Rostos"
+        </div>
+      </div>
+    </div>
+
     <!-- Limpar cena -->
     <button class="btn btn-danger btn-block" onclick="clearScene()">🗑️ Limpar Cena</button>
 
@@ -107,7 +120,7 @@
              renderer="antialias: true; colorManagement: true">
 
       <!-- Câmera -->
-      <a-entity id="rig" position="0 1.6 5">
+      <a-entity id="rig" position="0 0 5">
         <a-camera wasd-controls look-controls></a-camera>
       </a-entity>
 
@@ -128,6 +141,9 @@
 
       <!-- Contentor de objetos da cena -->
       <a-entity id="sceneObjects"></a-entity>
+
+      <!-- Avatares das pessoas detectadas pela câmera (modo Rostos) -->
+      <a-entity id="faceAvatars"></a-entity>
 
       <!-- Céu -->
       <a-sky id="sky" color="#87CEEB"></a-sky>
