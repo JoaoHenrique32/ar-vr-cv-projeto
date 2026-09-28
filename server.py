@@ -153,6 +153,175 @@ POSE_CONNECTIONS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Rostos – Detecção (Haar Cascade) e mapeamento 2D → 3D
+# ---------------------------------------------------------------------------
+# O classificador é carregado uma única vez (carregar o XML a cada frame
+# custa caro e derruba o FPS do WebSocket).
+_face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+FACE_X_RANGE = 2.0          # X no mundo 3D vai de -2.0 (esquerda) a +2.0 (direita)
+FACE_Y_RANGE = 0.6          # variação vertical (m) em torno da altura dos olhos
+FACE_EYE_HEIGHT = 1.6       # altura média dos olhos de uma pessoa em pé (m)
+FACE_MIN_Y = 1.0            # evita que o avatar "afunde" no chão
+FACE_REAL_WIDTH = 0.15      # largura média de um rosto humano (m)
+FACE_FOCAL_RATIO = 0.9      # focal ≈ 0.9 × largura do frame (webcam com FOV ~60°)
+FACE_DEPTH_SCALE = 2.0      # exagera a profundidade para o movimento ficar visível na cena
+FACE_MIN_Z, FACE_MAX_Z = -8.0, -0.5
+FACE_MATCH_DIST = 0.2       # distância máx. (normalizada) para considerar o mesmo rosto
+FACE_MAX_MISSING = 5        # frames tolerados sem detecção antes de remover a entidade
+
+
+def _detect_faces(frame: np.ndarray):
+    """Detecta múltiplos rostos com Haar Cascade. Retorna lista de (x, y, w, h)."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Equalização de histograma melhora a detecção com iluminação irregular
+    gray = cv2.equalizeHist(gray)
+    faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    return [tuple(int(v) for v in f) for f in faces]
+
+
+def _face_to_world(x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> dict:
+    """
+    Converte o bounding box de um rosto (pixels) em coordenadas 3D (metros).
+
+    - X: centro do rosto normalizado para [0, 1], deslocado para [-0.5, 0.5]
+         e escalado para [-FACE_X_RANGE, +FACE_X_RANGE]. O centro do frame vira X = 0.
+    - Y: na imagem o eixo Y cresce para BAIXO; em computação gráfica cresce para
+         CIMA. Por isso usamos (0.5 - cy_norm): topo da imagem → Y positivo.
+         Somamos a altura dos olhos para o avatar ficar numa altura realista.
+    - Z: modelo pinhole da câmera → distância = (largura_real × focal_px) / largura_px.
+         Ou seja, Z é inversamente proporcional a w: rosto grande = perto,
+         rosto pequeno = longe. O sinal negativo coloca o avatar "à frente"
+         do observador (em Three.js/A-Frame a câmera olha para -Z).
+    """
+    cx_norm = (x + w / 2) / frame_w
+    cy_norm = (y + h / 2) / frame_h
+
+    world_x = (cx_norm - 0.5) * 2 * FACE_X_RANGE
+    world_y = max(FACE_MIN_Y, FACE_EYE_HEIGHT + (0.5 - cy_norm) * 2 * FACE_Y_RANGE)
+
+    focal_constant = FACE_REAL_WIDTH * FACE_FOCAL_RATIO * frame_w
+    distance = focal_constant / max(w, 1)  # distância estimada em metros
+    world_z = min(max(-distance * FACE_DEPTH_SCALE, FACE_MIN_Z), FACE_MAX_Z)
+
+    return {
+        "x": round(world_x, 3),
+        "y": round(world_y, 3),
+        "z": round(world_z, 3),
+        "distance": round(distance, 2),
+    }
+
+
+class FaceTracker:
+    """
+    Rastreador simples por centroide: associa cada rosto detectado ao rosto mais
+    próximo do frame anterior, mantendo o mesmo ID/nome entre frames. Sem isso,
+    a ordem retornada pelo Haar Cascade muda e os avatares "trocariam" de lugar.
+    """
+
+    def __init__(self):
+        self.tracks = {}   # id -> {"cx", "cy", "bbox", "missing"}
+        self.next_id = 1
+
+    def update(self, faces, frame_w: int, frame_h: int):
+        detections = [((x + w / 2) / frame_w, (y + h / 2) / frame_h, (x, y, w, h)) for (x, y, w, h) in faces]
+
+        # Pares (distância, track_id, índice_detecção) ordenados → associação gulosa
+        pairs = sorted(
+            (np.hypot(t["cx"] - cx, t["cy"] - cy), tid, i)
+            for tid, t in self.tracks.items()
+            for i, (cx, cy, _) in enumerate(detections)
+        )
+        used_tracks, used_dets = set(), set()
+        for dist, tid, i in pairs:
+            if dist > FACE_MATCH_DIST or tid in used_tracks or i in used_dets:
+                continue
+            cx, cy, bbox = detections[i]
+            self.tracks[tid].update(cx=cx, cy=cy, bbox=bbox, missing=0)
+            used_tracks.add(tid)
+            used_dets.add(i)
+
+        # Rostos novos → novos IDs
+        for i, (cx, cy, bbox) in enumerate(detections):
+            if i not in used_dets:
+                self.tracks[self.next_id] = {"cx": cx, "cy": cy, "bbox": bbox, "missing": 0}
+                used_tracks.add(self.next_id)
+                self.next_id += 1
+
+        # Rostos não vistos: tolera alguns frames (Haar "pisca") e depois remove
+        for tid in list(self.tracks):
+            if tid not in used_tracks:
+                self.tracks[tid]["missing"] += 1
+                if self.tracks[tid]["missing"] > FACE_MAX_MISSING:
+                    del self.tracks[tid]
+
+        return self.tracks
+
+
+# Um rastreador por cliente (câmera) conectado, indexado pelo sid do Socket.IO
+_face_trackers = {}
+# Últimas entidades enviadas por cada câmera (para quem entra na sala arvr depois)
+_latest_face_entities = {}
+
+
+def _build_face_entities(sid: str, faces, frame_w: int, frame_h: int):
+    """Atualiza o rastreador do cliente e gera as entidades 3D estruturadas."""
+    tracker = _face_trackers.setdefault(sid, FaceTracker())
+    entities = []
+    for tid, track in sorted(tracker.update(faces, frame_w, frame_h).items()):
+        x, y, w, h = track["bbox"]
+        entities.append({
+            "id": f"{sid[:6]}-{tid}",
+            "track_id": tid,
+            "name": f"Pessoa {tid}",
+            "bbox": {"x": x, "y": y, "w": w, "h": h},
+            "position": _face_to_world(x, y, w, h, frame_w, frame_h),
+            "visible": track["missing"] == 0,
+        })
+    return entities
+
+
+def _publish_faces(sid: str, entities):
+    """Envia as entidades de rostos para a cena VR (sala arvr)."""
+    _latest_face_entities[sid] = entities
+    socketio.emit("faces_update", {"type": "faces", "source": sid, "entities": entities}, to="arvr")
+
+
+def _clear_faces(sid: str):
+    """Remove o rastreador do cliente e avisa a cena VR para apagar seus avatares."""
+    _face_trackers.pop(sid, None)
+    if _latest_face_entities.pop(sid, None) is not None:
+        socketio.emit("faces_update", {"type": "faces", "source": sid, "entities": []}, to="arvr")
+
+
+def _draw_face_entities(frame: np.ndarray, entities):
+    """Desenha bounding box + nome + distância estimada de cada rosto visível."""
+    result = frame.copy()
+    for ent in entities:
+        if not ent["visible"]:
+            continue
+        b = ent["bbox"]
+        cv2.rectangle(result, (b["x"], b["y"]), (b["x"] + b["w"], b["y"] + b["h"]), (255, 0, 0), 2)
+        label = f"{ent['name']} ~{ent['position']['distance']}m"
+        cv2.putText(result, label, (b["x"], b["y"] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+    return result
+
+
+def _process_faces(frame: np.ndarray, sid: str):
+    """Pipeline completo de rostos: detecção → entidades 3D → envio para o VR."""
+    frame_h, frame_w = frame.shape[:2]
+    faces = _detect_faces(frame)
+    entities = _build_face_entities(sid, faces, frame_w, frame_h)
+    _publish_faces(sid, entities)
+    result = _draw_face_entities(frame, entities)
+    detections = [{"type": "faces", "count": len(faces), "text": f"{len(faces)} rosto(s) detectado(s)"}]
+    detections += [
+        {"type": "faces", "text": f"{e['name']} → ({e['position']['x']}, {e['position']['y']}, {e['position']['z']})"}
+        for e in entities if e["visible"]
+    ]
+    return result, detections, entities
+
+# ---------------------------------------------------------------------------
 # Estado da cena AR/VR (compartilhado entre todos os clientes)
 # ---------------------------------------------------------------------------
 scene_state = {
@@ -621,6 +790,8 @@ def on_connect():
 
 @socketio.on("disconnect")
 def on_disconnect():
+    # Se esse cliente era uma câmera enviando rostos, remove seus avatares do VR
+    _clear_faces(request.sid)
     logger.info("Cliente desconectado")
 
 
@@ -635,6 +806,9 @@ def on_join_arvr():
     connected_clients["arvr"] += 1
     logger.info("Cliente entrou na sala arvr. Total: %d", connected_clients["arvr"])
     emit("scene_state", scene_state)
+    # Envia os avatares de rostos já detectados por cada câmera conectada
+    for source, entities in _latest_face_entities.items():
+        emit("faces_update", {"type": "faces", "source": source, "entities": entities})
 
 
 @socketio.on("leave_arvr")
@@ -775,7 +949,11 @@ def on_cv_frame(data):
             emit("cv_result", {"error": "Não foi possível decodificar a imagem."})
             return
 
-        result_frame, detections = _apply_pipeline(frame, pipeline)
+        if pipeline == "faces":
+            result_frame, detections, _ = _process_faces(frame, request.sid)
+        else:
+            _clear_faces(request.sid)
+            result_frame, detections = _apply_pipeline(frame, pipeline)
 
         # Codifica resultado de volta para base64
         _, buffer = cv2.imencode(".jpg", result_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -812,10 +990,8 @@ def _apply_pipeline(frame: np.ndarray, pipeline: str):
         detections.append({"type": "contours", "count": len(contours), "text": f"{len(contours)} contornos encontrados"})
 
     elif pipeline == "faces":
-        # Usa classificador Haar para detecção de rostos
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        # Usa classificador Haar para detecção de rostos (sem rastreamento/3D)
+        faces = _detect_faces(frame)
         result = frame.copy()
         for (x, y, w, h) in faces:
             cv2.rectangle(result, (x, y), (x + w, y + h), (255, 0, 0), 2)
@@ -978,11 +1154,20 @@ def _count_fingers_tasks(landmarks, handedness):
     return count
 
 
-def _apply_pipeline_3d(frame: np.ndarray, pipeline: str):
+def _apply_pipeline_3d(frame: np.ndarray, pipeline: str, sid: str = ""):
     """Aplica pipeline CV e extrai dados geométricos para mapeamento 3D."""
-    result_frame, detections = _apply_pipeline(frame, pipeline)
     h, w = frame.shape[:2]
     geometry = {"type": pipeline, "width": w, "height": h}
+
+    if pipeline == "faces":
+        # Detecção única por frame: gera imagem anotada + entidades 3D rastreadas
+        result_frame, detections, entities = _process_faces(frame, sid)
+        geometry["entities"] = entities
+        # Compatibilidade com o formato antigo (apenas bounding boxes visíveis)
+        geometry["faces"] = [e["bbox"] for e in entities if e["visible"]]
+        return result_frame, detections, geometry
+
+    result_frame, detections = _apply_pipeline(frame, pipeline)
 
     if pipeline == "contours":
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1002,17 +1187,6 @@ def _apply_pipeline_3d(frame: np.ndarray, pipeline: str):
         # Limitar a 50 maiores contornos
         shapes.sort(key=lambda s: s["area"], reverse=True)
         geometry["shapes"] = shapes[:50]
-
-    elif pipeline == "faces":
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-        rects = []
-        for (x, y, fw, fh) in faces:
-            rects.append({"x": int(x), "y": int(y), "w": int(fw), "h": int(fh)})
-        geometry["faces"] = rects
 
     elif pipeline == "edges":
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1087,7 +1261,9 @@ def on_cv3d_frame(data):
             emit("cv3d_result", {"error": "Não foi possível decodificar a imagem."})
             return
 
-        result_frame, detections, geometry = _apply_pipeline_3d(frame, pipeline)
+        if pipeline != "faces":
+            _clear_faces(request.sid)
+        result_frame, detections, geometry = _apply_pipeline_3d(frame, pipeline, request.sid)
 
         _, buffer = cv2.imencode(".jpg", result_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         result_b64 = "data:image/jpeg;base64," + base64.b64encode(buffer).decode("utf-8")
