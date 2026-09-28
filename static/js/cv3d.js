@@ -4,7 +4,7 @@
  * Conecta detecções de visão computacional (OpenCV) a uma cena 3D (Three.js).
  * Cada pipeline CV gera objetos 3D correspondentes:
  *   - contours → formas extrudadas
- *   - faces    → esferas posicionadas
+ *   - faces    → avatares 3D (cabeça + corpo + nome) rastreados e suavizados
  *   - edges    → wireframe / pontos
  *   - color    → nuvem de pontos colorida
  *   - threshold→ pontos binários
@@ -76,6 +76,9 @@ fpsRange.addEventListener("input", () => {
    ═══════════════════════════════════════════════════════════════════════ */
 let scene, camera, renderer, controls, gridHelper, axesHelper;
 let cvGroup; // grupo para objetos gerados pelo CV (limpos a cada frame)
+let avatarGroup; // grupo dos avatares de rostos (persistem entre frames)
+const avatars = new Map(); // id da entidade → { group, target }
+const clock = new THREE.Clock();
 
 function initThreeScene() {
   const container = document.getElementById("threejsContainer");
@@ -145,6 +148,11 @@ function initThreeScene() {
   cvGroup.name = "cvObjects";
   scene.add(cvGroup);
 
+  // Grupo para avatares de rostos
+  avatarGroup = new THREE.Group();
+  avatarGroup.name = "faceAvatars";
+  scene.add(avatarGroup);
+
   // Resize
   const ro = new ResizeObserver(() => {
     const cw = container.clientWidth;
@@ -160,7 +168,9 @@ function initThreeScene() {
 
 function animate() {
   requestAnimationFrame(animate);
+  const dt = clock.getDelta();
   controls.update();
+  updateAvatars(dt);
   renderer.render(scene, camera);
 }
 
@@ -203,12 +213,16 @@ function pixelToWorld(px, py, imgW, imgH, rangeX = 5, rangeY = 4, zBase = 0) {
 
 function mapGeometry(geometry) {
   clearCVGroup();
+  // Avatares só existem no modo "faces"; em outro modo, remove todos
+  if (geometry.type !== "faces") syncFaceAvatars([]);
 
   const { type, width, height } = geometry;
   let elementCount = 0;
 
   if (type === "contours" && geometry.shapes) {
     elementCount = mapContours(geometry.shapes, width, height);
+  } else if (type === "faces" && geometry.entities) {
+    elementCount = syncFaceAvatars(geometry.entities);
   } else if (type === "faces" && geometry.faces) {
     elementCount = mapFaces(geometry.faces, width, height);
   } else if (type === "edges" && geometry.points) {
@@ -307,6 +321,135 @@ function mapFaces(faces, imgW, imgH) {
 
   updateMappingInfo("faces", faces.length, `${faces.length} rosto(s) → esferas 3D`);
   return faces.length;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   Avatares de rostos (entidades 3D rastreadas)
+   ═══════════════════════════════════════════════════════════════════════ */
+const AVATAR_COLORS = [0xff6584, 0x6c63ff, 0x43e97b, 0xffb74d, 0x00bcd4, 0xba68c8];
+const LERP_SPEED = 8; // quanto maior, mais rápido o avatar alcança a posição alvo
+
+function makeLabelSprite(text, color) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+  ctx.beginPath();
+  ctx.roundRect(4, 4, 248, 56, 16);
+  ctx.fill();
+  ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+  ctx.font = "bold 30px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 128, 34);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  // depthTest desligado: o nome fica sempre visível, mesmo atrás de outro avatar
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: texture, depthTest: false }));
+  sprite.scale.set(0.8, 0.2, 1);
+  sprite.renderOrder = 10;
+  return sprite;
+}
+
+/** Cria um avatar: a origem do grupo fica no centro da cabeça. */
+function createAvatar(entity) {
+  const color = AVATAR_COLORS[(entity.track_id - 1) % AVATAR_COLORS.length];
+  const group = new THREE.Group();
+  const bodyMat = new THREE.MeshStandardMaterial({ color, metalness: 0.2, roughness: 0.6 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: 0xf1c27d, roughness: 0.7 });
+  const eyeMat = new THREE.MeshBasicMaterial({ color: 0x111111 });
+
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.2, 24, 24), skinMat);
+  head.castShadow = true;
+  group.add(head);
+
+  // Olhos no +Z local: é o lado que o lookAt() aponta para a câmera
+  for (const ex of [-0.07, 0.07]) {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.03, 12, 12), eyeMat);
+    eye.position.set(ex, 0.04, 0.18);
+    group.add(eye);
+  }
+
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 0.6, 8, 16), bodyMat);
+  body.position.y = -0.72;
+  body.castShadow = true;
+  group.add(body);
+
+  const label = makeLabelSprite(entity.name, color);
+  label.position.y = 0.45;
+  group.add(label);
+
+  group.userData.label = label;
+  return group;
+}
+
+function disposeAvatar(group) {
+  group.traverse((obj) => {
+    if (obj.geometry) obj.geometry.dispose();
+    if (obj.material) {
+      if (obj.material.map) obj.material.map.dispose();
+      obj.material.dispose();
+    }
+  });
+}
+
+/**
+ * Sincroniza os avatares com a lista de entidades recebida do servidor:
+ * cria os novos, atualiza a posição alvo dos existentes e remove os que sumiram.
+ */
+function syncFaceAvatars(entities) {
+  const seen = new Set();
+
+  for (const ent of entities) {
+    seen.add(ent.id);
+    const target = new THREE.Vector3(ent.position.x, ent.position.y, ent.position.z);
+    let avatar = avatars.get(ent.id);
+    if (!avatar) {
+      const group = createAvatar(ent);
+      group.position.copy(target); // nasce direto no lugar (sem "voar" da origem)
+      avatarGroup.add(group);
+      avatar = { group, target };
+      avatars.set(ent.id, avatar);
+      log(`Avatar criado: ${ent.name}`);
+    }
+    avatar.target.copy(target);
+    // Rosto temporariamente perdido (tolerância do rastreador) → semitransparente
+    avatar.group.traverse((obj) => {
+      if (obj.material) {
+        obj.material.transparent = true;
+        obj.material.opacity = ent.visible ? 1 : 0.4;
+      }
+    });
+  }
+
+  for (const [id, avatar] of avatars) {
+    if (!seen.has(id)) {
+      avatarGroup.remove(avatar.group);
+      disposeAvatar(avatar.group);
+      avatars.delete(id);
+      log(`Avatar removido: ${id}`, "warning");
+    }
+  }
+
+  if (entities.length || avatars.size === 0) {
+    updateMappingInfo("faces", entities.length, `${entities.length} pessoa(s) → avatares 3D`);
+  }
+  return entities.length;
+}
+
+/** Chamado a cada frame de renderização: lerp da posição + olhar para a câmera. */
+function updateAvatars(dt) {
+  // Fator de lerp independente do FPS: 1 - e^(-k·dt)
+  const alpha = 1 - Math.exp(-LERP_SPEED * dt);
+  const lookTarget = new THREE.Vector3();
+  for (const { group, target } of avatars.values()) {
+    group.position.lerp(target, alpha);
+    // Olha para a câmera apenas no plano horizontal (o corpo não inclina)
+    lookTarget.set(camera.position.x, group.position.y, camera.position.z);
+    group.lookAt(lookTarget);
+  }
 }
 
 function mapEdgesWireframe(points, imgW, imgH) {
@@ -417,7 +560,7 @@ function updateMappingInfo(pipeline, count, text) {
   const pipelineLabels = {
     edges: "🟢 Bordas → Wireframe",
     contours: "🟣 Contornos → Formas Extrudadas",
-    faces: "🔴 Rostos → Esferas",
+    faces: "🔴 Rostos → Avatares 3D",
     color: "🟡 Cor → Nuvem de Pontos",
     threshold: "🔵 Limiar → Pontos Binários",
   };
