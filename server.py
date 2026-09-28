@@ -53,7 +53,7 @@ app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE", "f
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
 # allow_upgrades=True garante suporte a WebSocket via eventlet/gevent
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet", logger=False, engineio_logger=False)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent", logger=False, engineio_logger=False)
 
 AUTH_PASSWORD_ENV = "APP_ACCESS_PASSWORD"
 
